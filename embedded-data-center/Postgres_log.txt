@@ -1,0 +1,172 @@
+Key Features
+
+Parameterized Creation: Create log tables with any name and row limit
+Optimized Structure:
+
+id: BIGSERIAL primary key for efficient operations
+timestamp: Timestamped entries with timezone support
+log_data: JSONB field for flexible structured log data
+
+
+Automatic Row Limiting: Trigger-based system that automatically removes oldest entries
+Helper Functions:
+
+create_log_table(table_name, row_limit): Creates the table and trigger
+log_entry(table_name, json_data): Adds new log entries
+get_latest_logs(table_name, limit): Retrieves most recent logs
+update_log_row_limit(table_name, new_limit): Changes the row limit
+
+
+
+Example Usage
+
+-- Create a log table with 1000 row limit
+SELECT create_log_table('application_logs', 1000);
+
+-- Add a log entry
+SELECT log_entry('application_logs', 
+  '{"level": "info", "message": "User logged in", "user_id": 123}');
+
+-- Retrieve the 10 most recent logs
+SELECT * FROM get_latest_logs('application_logs', 10);
+
+-- Update row limit to 500
+SELECT update_log_row_limit('application_logs', 500);
+
+code for functions
+
+-- Function to create a parameterized log table with row limit trigger
+CREATE OR REPLACE FUNCTION create_log_table(
+    p_table_name TEXT,
+    p_row_limit INT
+) RETURNS VOID AS $$
+DECLARE
+    trigger_name TEXT;
+    function_name TEXT;
+BEGIN
+    -- Set names for the trigger and function
+    trigger_name := p_table_name || '_row_limit_trigger';
+    function_name := p_table_name || '_maintain_limit_fn';
+    
+    -- Create the log table if it doesn't exist
+    EXECUTE format('
+        CREATE TABLE IF NOT EXISTS %I (
+            id BIGSERIAL PRIMARY KEY,
+            timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            log_data JSONB NOT NULL
+        )', p_table_name);
+    
+    -- Create index on timestamp for faster sorting and pruning
+    EXECUTE format('
+        CREATE INDEX IF NOT EXISTS %I ON %I (timestamp DESC)', 
+        p_table_name || '_timestamp_idx', 
+        p_table_name);
+    
+    -- Create the function to maintain row limit
+    EXECUTE format('
+        CREATE OR REPLACE FUNCTION %I() RETURNS TRIGGER AS $func$
+        BEGIN
+            -- Delete older rows that exceed the limit
+            EXECUTE format(''DELETE FROM %I
+                           WHERE id IN (
+                               SELECT id FROM %I
+                               ORDER BY timestamp DESC
+                               OFFSET %s
+                           )'', TG_TABLE_NAME, TG_TABLE_NAME, %L);
+            RETURN NEW;
+        END;
+        $func$ LANGUAGE plpgsql;', 
+        function_name, 
+        p_row_limit::TEXT);
+    
+    -- Drop the trigger if it exists (to allow for row limit updates)
+    EXECUTE format('
+        DROP TRIGGER IF EXISTS %I ON %I', 
+        trigger_name, 
+        p_table_name);
+    
+    -- Create the trigger
+    EXECUTE format('
+        CREATE TRIGGER %I
+        AFTER INSERT ON %I
+        EXECUTE FUNCTION %I()', 
+        trigger_name, 
+        p_table_name, 
+        function_name);
+        
+    -- Output confirmation
+    RAISE NOTICE 'Created log table % with % row limit', p_table_name, p_row_limit;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to insert a log entry
+CREATE OR REPLACE FUNCTION log_entry(
+    p_table_name TEXT,
+    p_log_data JSONB
+) RETURNS BIGINT AS $$
+DECLARE
+    log_id BIGINT;
+BEGIN
+    -- Insert the log entry and return the ID
+    EXECUTE format('
+        INSERT INTO %I (log_data) 
+        VALUES ($1) 
+        RETURNING id', 
+        p_table_name)
+    INTO log_id
+    USING p_log_data;
+    
+    RETURN log_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to query the latest logs
+CREATE OR REPLACE FUNCTION get_latest_logs(
+    p_table_name TEXT,
+    p_limit INT DEFAULT 100
+) RETURNS TABLE (
+    id BIGINT,
+    timestamp TIMESTAMP WITH TIME ZONE,
+    log_data JSONB
+) AS $$
+BEGIN
+    RETURN QUERY EXECUTE format('
+        SELECT id, timestamp, log_data
+        FROM %I
+        ORDER BY timestamp DESC
+        LIMIT $1', 
+        p_table_name)
+    USING p_limit;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to update the row limit for an existing log table
+CREATE OR REPLACE FUNCTION update_log_row_limit(
+    p_table_name TEXT,
+    p_new_limit INT
+) RETURNS VOID AS $$
+BEGIN
+    -- This will recreate the function and trigger with the new limit
+    PERFORM create_log_table(p_table_name, p_new_limit);
+    
+    -- Immediately enforce the new limit
+    EXECUTE format('
+        DELETE FROM %I
+        WHERE id IN (
+            SELECT id FROM %I
+            ORDER BY timestamp DESC
+            OFFSET %s
+        )', 
+        p_table_name, 
+        p_table_name, 
+        p_new_limit::TEXT);
+        
+    RAISE NOTICE 'Updated % row limit to %', p_table_name, p_new_limit;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Example usage:
+-- SELECT create_log_table('application_logs', 1000);
+-- SELECT log_entry('application_logs', '{"level": "info", "message": "User logged in", "user_id": 123}');
+-- SELECT * FROM get_latest_logs('application_logs', 10);
+-- SELECT update_log_row_limit('application_logs', 500);
